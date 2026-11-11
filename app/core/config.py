@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_stt_model: str = Field(default="gpt-4o-mini-transcribe", min_length=1)
     openai_stt_timeout: float = Field(default=120, gt=0, allow_inf_nan=False)
+    openai_llm_model: str = Field(default="gpt-4o-mini", min_length=1)
+    openai_llm_timeout: float = Field(default=120, gt=0, allow_inf_nan=False)
+    openai_llm_max_retries: int = Field(default=1, ge=0, le=5)
 
 
 @lru_cache
