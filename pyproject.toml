@@ -9,6 +9,7 @@ dependencies = [
     "pydantic-settings>=2.6,<3",
     "faster-whisper>=1.2.1",
     "openai>=3.49.0",
+    "sqlalchemy>=2.0,<3",
 ]
 
 [dependency-groups]
