@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Application data and local temporary files
+data/
+*.db
+*.sqlite3
+*.tmp
+*.swp
+*~
