@@ -3,7 +3,13 @@ name = "conversation-analyzer"
 version = "0.1.0"
 description = "Conversation recording and AI analysis backend"
 requires-python = ">=3.12"
-dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "pydantic-settings>=2.6,<3"]
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "pydantic-settings>=2.6,<3",
+    "faster-whisper>=1.2.1",
+    "openai>=3.49.0",
+]
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "httpx>=0.27,<1", "ruff>=0.8,<1"]
