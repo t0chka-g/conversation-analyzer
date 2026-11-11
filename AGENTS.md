@@ -21,7 +21,9 @@ Run from the project root:
 Modular FastAPI monolith with `create_app()` in `app/main.py`.
 Configuration uses pydantic-settings and cached `get_settings()`; logging uses standard Python logging.
 Keep external providers isolated when introduced. Use minimal abstractions; do not add microservices or infrastructure without requirements.
-Bootstrap, `/health` and standalone STT exist; LLM, storage, uploads and frontend belong to later stages.
+Bootstrap, `/health`, standalone STT and independent LLM Analyzer exist; storage, uploads and frontend belong to later stages.
+LLM Analyzer lives in `app/analysis`; its system prompt is `app/analysis/prompts/default.md`. Keep transcript content separate from system instructions and verify quoted evidence against input.
+Run the analyzer manually with `uv run python scripts/analyze.py transcript.txt`; this is the only path intended for paid LLM calls.
 
 # Agent rules
 - Reuse Python, uv and the single `.venv`; do not reinstall or switch environments without a demonstrated need.

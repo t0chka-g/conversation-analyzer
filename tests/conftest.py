@@ -21,6 +21,9 @@ def isolated_settings(monkeypatch, tmp_path):
         "OPENAI_API_KEY",
         "OPENAI_STT_MODEL",
         "OPENAI_STT_TIMEOUT",
+        "OPENAI_LLM_MODEL",
+        "OPENAI_LLM_TIMEOUT",
+        "OPENAI_LLM_MAX_RETRIES",
     ):
         monkeypatch.delenv(name, raising=False)
     get_settings.cache_clear()
