@@ -92,15 +92,20 @@ class AnalysisJobRepository:
         job_id: UUID,
         *,
         error_code: str,
-        error_stage: Literal["stt", "llm"],
+        error_stage: Literal["stt", "llm", "transcription", "analysis"],
     ) -> None:
         if not isinstance(error_code, str) or not re.fullmatch(
             r"[A-Z][A-Z0-9_]{0,63}", error_code
         ):
             raise ValueError("error_code must be an uppercase machine-readable code")
-        stages = {"stt": JobStatus.TRANSCRIBING, "llm": JobStatus.ANALYZING}
+        stages = {
+            "stt": JobStatus.TRANSCRIBING,
+            "llm": JobStatus.ANALYZING,
+            "transcription": JobStatus.TRANSCRIBING,
+            "analysis": JobStatus.ANALYZING,
+        }
         if error_stage not in stages:
-            raise ValueError("error_stage must be stt or llm")
+            raise ValueError("error_stage must be transcription/analysis (or stt/llm)")
         self._transition(
             job_id,
             stages[error_stage],

@@ -88,3 +88,32 @@ def storage(tmp_path):
     from app.storage.local import LocalAudioStorage
 
     return LocalAudioStorage(tmp_path / "audio", max_audio_size_mb=1)
+
+
+@pytest.fixture
+def pipeline_case(session_factory, storage, analysis_result):
+    from io import BytesIO
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.application.create_job import create_job
+    from app.application.pipeline import ProcessingPipeline
+
+    job_id = create_job(
+        BytesIO(b"test audio"),
+        filename="test.wav",
+        source="upload",
+        storage=storage,
+        session_factory=session_factory,
+    )
+    transcriber = SimpleNamespace(transcribe=AsyncMock(return_value="  Какая цель?\n"))
+    analyzer = SimpleNamespace(analyze=AsyncMock(return_value=analysis_result))
+    pipeline = ProcessingPipeline(
+        transcriber=transcriber,
+        analyzer=analyzer,
+        session_factory=session_factory,
+        storage=storage,
+    )
+    return SimpleNamespace(
+        pipeline=pipeline, job_id=job_id, transcriber=transcriber, analyzer=analyzer
+    )

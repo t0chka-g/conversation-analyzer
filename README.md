@@ -49,9 +49,12 @@ app/
   persistence/    # Engine, Session Factory, AnalysisJob и Repository
   storage/local.py # потоковое локальное хранение аудио
   application/create_job.py # создание задачи с компенсацией ошибок БД
+  application/pipeline.py # обработка задачи: STT, транскрипт, LLM, результат
+  application/runner.py # переиспользуемые ресурсы и BackgroundTasks callback
 scripts/transcribe.py # проверка STT из командной строки
 scripts/analyze.py    # анализ готовой транскрипции
 scripts/init_db.py    # явная инициализация SQLite
+scripts/process_job.py # обработка существующей задачи по UUID
 tests/             # изолированные тесты приложения и настроек
 AGENTS.md          # рабочие инструкции для следующих агентов
 ```
@@ -59,7 +62,8 @@ AGENTS.md          # рабочие инструкции для следующи
 Этап 1: окружение, application factory, настройки, логирование, healthcheck и тесты.
 Этап 2: локальная и облачная транскрибация через единый асинхронный контракт.
 Этап 3: независимый LLM-анализ готовой транскрипции.
-Этап 4: SQLite, локальное хранение аудио и защищённый жизненный цикл задач. HTTP-загрузка, pipeline, фоновая обработка и frontend ещё не реализованы.
+Этап 4: SQLite, локальное хранение аудио и защищённый жизненный цикл задач.
+Этап 5: ProcessingPipeline, запуск существующей задачи по UUID и callback для BackgroundTasks. HTTP-загрузка, API результатов и frontend ещё не реализованы.
 
 
 ## Транскрибация
@@ -74,7 +78,7 @@ uv run python scripts/transcribe.py path/to/audio.wav
 
 Для облачного режима задайте `STT_PROVIDER=cloud` и `OPENAI_API_KEY` в окружении или локальном `.env`. `OPENAI_STT_MODEL` выбирает модель (по умолчанию `gpt-4o-mini-transcribe`), `OPENAI_STT_TIMEOUT` — таймаут в секундах. Облачные запросы требуют сети и могут быть платными. Локальному режиму ключ не нужен.
 
-В коде создайте провайдер через `create_transcriber(settings)` и повторно используйте его. У облачного провайдера после завершения работы вызовите `await provider.aclose()`. Оба провайдера возвращают строку; API загрузки и обработка аудио не входят в этот этап.
+В коде создайте провайдер через `create_transcriber(settings)` и повторно используйте его. У облачного провайдера после завершения работы вызовите `await provider.aclose()`. Оба провайдера возвращают строку; pipeline использует этот же контракт. HTTP API загрузки пока отсутствует.
 
 ## Анализ готовой транскрипции
 
@@ -118,13 +122,13 @@ stateDiagram-v2
     PENDING --> TRANSCRIBING: claim_pending
     TRANSCRIBING --> ANALYZING: save_transcript
     ANALYZING --> COMPLETED: complete
-    TRANSCRIBING --> FAILED: fail / stt
-    ANALYZING --> FAILED: fail / llm
+    TRANSCRIBING --> FAILED: fail / transcription
+    ANALYZING --> FAILED: fail / analysis
     COMPLETED --> [*]
     FAILED --> [*]
 ```
 
-Все переходы используют `UPDATE ... WHERE id = ... AND status = ...` с проверкой числа строк. Повторный захват и запоздавшая ошибка после завершения отклоняются через `InvalidJobTransitionError`; отсутствующий UUID даёт `AnalysisJobNotFoundError`. Терминальные состояния не изменяются через Repository. STT-ошибка допустима только в `TRANSCRIBING`, LLM-ошибка — в `ANALYZING`. `error_stage` принимает `stt` или `llm`; `error_code` — заранее выбранный машинный код вида `STT_TIMEOUT` (латинские заглавные буквы, цифры, `_`, до 64 символов). Не передавайте текст исключения, ключи или ответы провайдеров в поля ошибок.
+Все переходы используют `UPDATE ... WHERE id = ... AND status = ...` с проверкой числа строк. Повторный захват и запоздавшая ошибка после завершения отклоняются через `InvalidJobTransitionError`; отсутствующий UUID даёт `AnalysisJobNotFoundError`. Терминальные состояния не изменяются через Repository. STT-ошибка допустима только в `TRANSCRIBING`, LLM-ошибка — в `ANALYZING`. Pipeline сохраняет `error_stage=transcription` или `analysis`; прежние значения `stt` и `llm` также принимаются Repository для совместимости с этапом 4. `error_code` — заранее выбранный машинный код вида `TRANSCRIPTION_TIMEOUT` (латинские заглавные буквы, цифры, `_`, до 64 символов). Не передавайте текст исключения, ключи или ответы провайдеров в поля ошибок.
 
 `AnalysisJobRepository` получает сессию от вызывающего кода, делает flush/условные обновления и никогда не вызывает commit. `session_factory.begin()` фиксирует успешную операцию, при исключении выполняет rollback и всегда закрывает сессию. ORM-объекты остаются внутри persistence/application-слоя; будущий API должен преобразовать их в собственные ответы, а провайдеры получают путь или строку.
 
@@ -134,7 +138,6 @@ stateDiagram-v2
 from app.application.create_job import create_job
 from app.core.config import get_settings
 from app.persistence.database import create_database_engine, create_session_factory
-from app.persistence.repository import AnalysisJobRepository
 from app.storage.local import LocalAudioStorage
 
 settings = get_settings()
@@ -150,22 +153,76 @@ try:
             storage=storage,
             session_factory=sessions,
         )
-    # Только подготовка операций для будущего обработчика, без вызовов STT/LLM.
-    with sessions.begin() as session:
-        AnalysisJobRepository(session).claim_pending(job_id)
-    transcript = "Уже полученный результат STT"
-    with sessions.begin() as session:
-        AnalysisJobRepository(session).save_transcript(job_id, transcript)
-    # Позже: отдельная транзакция complete(job_id, analysis_result),
-    # либо fail(job_id, error_code="LLM_TIMEOUT", error_stage="llm").
+    print(job_id)  # Задача остаётся PENDING; передайте UUID в process_job.py.
 finally:
     engine.dispose()
 ```
 
-Захват нужно зафиксировать до работы STT. Транскрипт и `ANALYZING` сохраняются атомарно и фиксируются до вызова LLM; ошибка анализа не удаляет транскрипт. Анализ и `COMPLETED` также записываются одним обновлением. Держите каждую транзакцию короткой: сетевые STT/LLM-вызовы выполняются вне неё. Синхронные операции БД и файловой системы в будущем API следует вызывать из sync-handler или thread pool, не выполнять длительную работу в event loop. Не делитесь сессией между потоками/задачами.
+Захват нужно зафиксировать до работы STT. Транскрипт и `ANALYZING` сохраняются атомарно и фиксируются до вызова LLM; ошибка анализа не удаляет транскрипт. Анализ и `COMPLETED` также записываются одним обновлением. Pipeline выполняет синхронные операции БД и проверку аудио через `anyio.to_thread.run_sync`. Каждая операция БД создаёт и закрывает собственную сессию в одном worker-потоке. Во время STT/LLM нет открытых сессий или транзакций pipeline. Исключение при записи или commit вызывает rollback.
 
 `LocalAudioStorage.save(stream, filename=...)` читает поток порциями до 64 KiB и отклоняет пустой файл или превышение лимита. Разрешены WAV, MP3, WebM, M4A (регистр расширения не важен). Проверка расширения предварительная: содержимое не декодируется и формат не подтверждается; конвертации и установки FFmpeg нет. Имя пользователя используется только для проверки расширения; имена с компонентами пути отклоняются. Файл получает отдельное UUID-имя, `save()` возвращает только относительный ключ. `get_path(key)` возвращает путь внутри хранилища, `delete(key)` удаляет файл (повторное удаление безопасно). Некорректные ключи, traversal и символические ссылки отклоняются через `AudioStorageError`. Входной поток закрывает вызывающий код.
 
 Файл сначала пишется во временный файл в том же каталоге, затем публикуется атомарным переименованием; при обычной ошибке неполный файл удаляется. Создание задачи сохраняет аудио, затем фиксирует `PENDING` в БД. Если flush или commit не удался, сервис удаляет сохранённый файл; если сама компенсация не удалась, сохраняет исходную ошибку и пишет обезличенное сообщение в лог. SQLite и файловая система не образуют общую транзакцию: аварийное завершение процесса или недоступность каталога могут оставить orphan-файлы, в том числе временные. Автоматической сверки/очистки и гарантий fsync при потере питания пока нет.
 
-Все тесты запускаются приведёнными выше командами без API-ключей, сети, скачивания моделей и inference. Новые тесты используют `tmp_path`, настоящую временную SQLite, отдельные сессии для гонок и не обращаются к рабочему `data/`. Проверяются транзакции, все переходы, конкурентный захват и завершение, ошибки файловой системы и компенсация после ошибки БД. Автоматическое восстановление задач, оставшихся в обработке после сбоя процесса, retry и исполнение pipeline относятся к следующему этапу.
+Все тесты запускаются приведёнными выше командами без API-ключей, сети, скачивания моделей и inference. Тесты используют `tmp_path`, настоящую временную SQLite, отдельные сессии для гонок и не обращаются к рабочему `data/`. Проверяются транзакции, все переходы, конкурентное исполнение pipeline, ошибки файловой системы, rollback при сбоях записи/commit, отзывчивость event loop, закрытие клиентов и переиспользование локальной модели.
+
+## ProcessingPipeline и фоновый запуск
+
+`ProcessingPipeline.process(job_id)` обрабатывает только существующую `PENDING`-задачу. Условный SQL UPDATE в `claim_pending` гарантирует единственный захват даже при одновременных вызовах в разных потоках/процессах. Конфликт захвата означает пропуск без STT/LLM; отсутствие задачи вызывает `AnalysisJobNotFoundError`. Повторный вызов для `TRANSCRIBING`, `ANALYZING`, `COMPLETED` или `FAILED` ничего не меняет. Автоматических повторов нет.
+
+```mermaid
+sequenceDiagram
+    participant Runner
+    participant Pipeline
+    participant Repository
+    participant STT
+    participant LLM
+    Runner->>Pipeline: process(job_id)
+    Pipeline->>Repository: claim_pending + read audio key (worker session)
+    Repository-->>Pipeline: commit PENDING → TRANSCRIBING, close session
+    Note over Pipeline: AudioStorage.get_path + check readability (worker)
+    Pipeline->>STT: await transcribe(path)
+    STT-->>Pipeline: transcript
+    Pipeline->>Repository: save_transcript (new worker session)
+    Repository-->>Pipeline: commit TRANSCRIBING → ANALYZING, close session
+    Pipeline->>LLM: await analyze(transcript)
+    LLM-->>Pipeline: validated AnalysisResult
+    Pipeline->>Repository: complete(result) (new worker session)
+    Repository-->>Pipeline: commit ANALYZING → COMPLETED, close session
+    opt Failure after claim
+        Pipeline->>Repository: fail(code, transcription/analysis) (new worker session)
+        Repository-->>Pipeline: commit active state → FAILED, close session
+        Pipeline-->>Runner: re-raise original exception
+    end
+```
+
+Pipeline получает безопасный путь из сохранённого ключа через `LocalAudioStorage`, проверяет чтение и передаёт существующий файл без копирования. Пустой транскрипт отклоняется, непустой передаётся в Analyzer без изменений. Используется прежний промпт, Structured Outputs, grounding и `AnalysisResult`; дополнительной схемы результата нет. Repository повторно проверяет модель перед атомарной записью JSON и статуса `COMPLETED`.
+
+Ошибки доступа к аудио, STT и записи транскрипта сохраняются со стадией `transcription`; ошибки LLM и записи результата — `analysis`. Основные коды: `AUDIO_UNAVAILABLE`, `EMPTY_TRANSCRIPT`, `TRANSCRIPTION_FAILED`, `TRANSCRIPTION_TIMEOUT`, `ANALYSIS_FAILED`, `ANALYSIS_TIMEOUT`, `ANALYSIS_INVALID`, `TRANSCRIPT_PERSISTENCE_FAILED`, `RESULT_PERSISTENCE_FAILED`. Таймауты распознаются также по цепочке исходных исключений провайдеров. Ошибка LLM не запускает повторный STT и сохраняет уже зафиксированный транскрипт.
+
+При сбое persistence выполняется rollback, затем отдельная попытка сохранить `FAILED`. Если БД по-прежнему недоступна, логируется инцидент; состояние может остаться активным. Запоздавшая ошибка не меняет терминальный статус. Собственные логи pipeline/runner содержат UUID, стадию и машинный код, без сообщений провайдеров, traceback и содержимого разговора. Исходные исключения пробрасываются вызывающему коду с сохранённой цепочкой; при интеграции учитывайте, что сторонний обработчик исключений может вывести их детали. Ошибки программирования также пробрасываются. Отмена async-задачи не превращается в ошибку провайдера и может оставить активный статус.
+
+Для ручной проверки существующей задачи:
+
+```bash
+# Предварительно создайте схему и задачу через create_job(), сохраните её UUID.
+uv run python scripts/process_job.py <job_id>
+```
+
+CLI не создаёт новую задачу и не меняет схему. Он использует существующие Settings (`DATABASE_URL`, `AUDIO_STORAGE_DIR`, STT/Whisper/OpenAI), выводит UUID и итоговый статус; код выхода 0 означает `COMPLETED`, 1 — ошибку или пропущенную незавершённую задачу. Нужен `OPENAI_API_KEY` для Analyzer, даже при локальном STT. Реальный запуск может скачивать Whisper-веса и выполнять платные STT/LLM-запросы; автоматические тесты этого не делают.
+
+`ProcessingRuntime` — минимальный владелец ресурсов для lifespan FastAPI и CLI. При импорте/старте приложения провайдеры не создаются, модель не загружается, БД не открывается. Первый `get_pipeline()` создаёт провайдеры через существующие фабрики; последующие задачи используют те же экземпляры. Whisper загружается при первой транскрибации в worker-потоке и сериализует inference своим существующим lock. Асинхронные клиенты закрываются при выходе из runtime, engine освобождается; частичная инициализация также очищает уже созданные ресурсы. Ошибка настройки провайдеров до захвата оставляет задачу `PENDING`.
+
+Для следующего HTTP-этапа подготовлен независимый callback (endpoint пока не добавлен):
+
+```python
+background_tasks.add_task(
+    run_analysis_job,
+    job_id,
+    runtime=application.state.processing_runtime,
+)
+```
+
+`run_analysis_job` принимает UUID и app-owned runtime, не зависит от Request и не получает request-scoped Session. Lifespan хранит runtime в `application.state.processing_runtime`; standalone-код использует `async with ProcessingRuntime(settings)`. Сам callback не закрывает общие ресурсы после каждой задачи.
+
+BackgroundTasks выполняет работу внутри процесса приложения. При аварийном завершении процесса задача может остаться незавершённой; durable delivery, восстановления зависших задач и persistent queue нет. При нескольких Uvicorn workers каждый процесс может загрузить свою локальную модель. Это ограниченный механизм MVP без production-grade гарантий доставки. Следующий этап может подключить HTTP API к готовому callback; retry, восстановление и frontend пока отсутствуют.

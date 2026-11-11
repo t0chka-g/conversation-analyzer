@@ -15,6 +15,7 @@ Run from the project root:
 - Format: `uv run ruff format .`; verify with `uv run ruff format --check .`.
 - Dependencies: `uv add <package>` or `uv add --dev <package>`; retain `uv.lock`.
 - Initialize SQLite: `uv run python scripts/init_db.py` (explicit, idempotent; no schema migrations).
+- Process an existing job: `uv run python scripts/process_job.py <job_id>`; manual only, can invoke paid STT/LLM and download local weights.
 - STT CLI: `uv run python scripts/transcribe.py path/to/audio.wav`. Local weights load lazily into the system Hugging Face cache; reuse the provider and close the cloud client with `aclose()`. Tests must not download models or call external APIs.
 - Optional local config: copy `.env.example` to `.env`; environment variables override `.env`.
 
@@ -22,10 +23,11 @@ Run from the project root:
 Modular FastAPI monolith with `create_app()` in `app/main.py`.
 Configuration uses pydantic-settings and cached `get_settings()`; logging uses standard Python logging.
 Keep external providers isolated when introduced. Use minimal abstractions; do not add microservices or infrastructure without requirements.
-Bootstrap, `/health`, standalone STT, independent LLM Analyzer, SQLite persistence and local audio storage exist; HTTP uploads, processing pipeline and frontend belong to later stages.
+Bootstrap, `/health`, standalone STT/LLM, SQLite persistence, local audio storage and ProcessingPipeline exist; HTTP uploads/results and frontend belong to later stages.
 Repository operations receive a session and never commit. Use `session_factory.begin()` for short transactions, keep STT/LLM calls outside them, and commit claims/transcripts before provider work. State transitions use conditional SQL updates, never read-then-write claims. Use `create_job()` for audio ingestion and DB-error compensation; audio keys are relative, timestamps are UTC. Tests use temporary SQLite/audio paths.
 LLM Analyzer lives in `app/analysis`; its system prompt is `app/analysis/prompts/default.md`. Keep transcript content separate from system instructions and verify quoted evidence against input.
-Run the analyzer manually with `uv run python scripts/analyze.py transcript.txt`; this is the only path intended for paid LLM calls.
+Run the analyzer manually with `uv run python scripts/analyze.py transcript.txt`, or process an existing job through the pipeline CLI; both can make paid LLM calls.
+Pipeline DB operations use `anyio.to_thread.run_sync` with a fresh session per operation; never share sessions across threads or hold them during provider calls. Use `ProcessingRuntime` in an async context for reusable providers and cleanup; FastAPI lifespan exposes it as `app.state.processing_runtime`. Pass it to `run_analysis_job(job_id, runtime=...)` for BackgroundTasks, never a request-scoped session. Pipeline error stages are `transcription`/`analysis`; repository aliases `stt`/`llm` remain compatible. BackgroundTasks is in-process without recovery or durable delivery.
 
 # Agent rules
 - Reuse Python, uv and the single `.venv`; do not reinstall or switch environments without a demonstrated need.
