@@ -42,8 +42,11 @@ uv run ruff format --check .
 app/
   main.py          # create_app() и ASGI app
   api/health.py    # GET /health
+  api/analyses.py  # POST /api/v1/analyses и GET /api/v1/analyses/{job_id}
+  api/schemas.py   # типизированные ответы с существующим AnalysisResult
   core/config.py  # настройки и get_settings()
   core/logging.py # стандартное логирование
+  core/dependencies.py # зависимости HTTP из lifespan приложения
   transcription/  # контракт, локальный и облачный STT, фабрика
   analysis/       # LLM Analyzer, модели, промпт и проверка цитат
   persistence/    # Engine, Session Factory, AnalysisJob и Repository
@@ -63,7 +66,8 @@ AGENTS.md          # рабочие инструкции для следующи
 Этап 2: локальная и облачная транскрибация через единый асинхронный контракт.
 Этап 3: независимый LLM-анализ готовой транскрипции.
 Этап 4: SQLite, локальное хранение аудио и защищённый жизненный цикл задач.
-Этап 5: ProcessingPipeline, запуск существующей задачи по UUID и callback для BackgroundTasks. HTTP-загрузка, API результатов и frontend ещё не реализованы.
+Этап 5: ProcessingPipeline, запуск существующей задачи по UUID и callback для BackgroundTasks.
+Этап 6: REST API загрузки аудио, фоновый запуск и получение статуса/результатов. Frontend пока отсутствует.
 
 
 ## Транскрибация
@@ -78,7 +82,7 @@ uv run python scripts/transcribe.py path/to/audio.wav
 
 Для облачного режима задайте `STT_PROVIDER=cloud` и `OPENAI_API_KEY` в окружении или локальном `.env`. `OPENAI_STT_MODEL` выбирает модель (по умолчанию `gpt-4o-mini-transcribe`), `OPENAI_STT_TIMEOUT` — таймаут в секундах. Облачные запросы требуют сети и могут быть платными. Локальному режиму ключ не нужен.
 
-В коде создайте провайдер через `create_transcriber(settings)` и повторно используйте его. У облачного провайдера после завершения работы вызовите `await provider.aclose()`. Оба провайдера возвращают строку; pipeline использует этот же контракт. HTTP API загрузки пока отсутствует.
+В коде создайте провайдер через `create_transcriber(settings)` и повторно используйте его. У облачного провайдера после завершения работы вызовите `await provider.aclose()`. Оба провайдера возвращают строку; pipeline использует этот же контракт.
 
 ## Анализ готовой транскрипции
 
@@ -130,7 +134,7 @@ stateDiagram-v2
 
 Все переходы используют `UPDATE ... WHERE id = ... AND status = ...` с проверкой числа строк. Повторный захват и запоздавшая ошибка после завершения отклоняются через `InvalidJobTransitionError`; отсутствующий UUID даёт `AnalysisJobNotFoundError`. Терминальные состояния не изменяются через Repository. STT-ошибка допустима только в `TRANSCRIBING`, LLM-ошибка — в `ANALYZING`. Pipeline сохраняет `error_stage=transcription` или `analysis`; прежние значения `stt` и `llm` также принимаются Repository для совместимости с этапом 4. `error_code` — заранее выбранный машинный код вида `TRANSCRIPTION_TIMEOUT` (латинские заглавные буквы, цифры, `_`, до 64 символов). Не передавайте текст исключения, ключи или ответы провайдеров в поля ошибок.
 
-`AnalysisJobRepository` получает сессию от вызывающего кода, делает flush/условные обновления и никогда не вызывает commit. `session_factory.begin()` фиксирует успешную операцию, при исключении выполняет rollback и всегда закрывает сессию. ORM-объекты остаются внутри persistence/application-слоя; будущий API должен преобразовать их в собственные ответы, а провайдеры получают путь или строку.
+`AnalysisJobRepository` получает сессию от вызывающего кода, делает flush/условные обновления и никогда не вызывает commit. `session_factory.begin()` фиксирует успешную операцию, при исключении выполняет rollback и всегда закрывает сессию. HTTP-адаптер преобразует данные ORM в типизированный ответ до закрытия сессии; провайдеры получают путь или строку.
 
 Пример создания задачи из бинарного потока без зависимости от FastAPI:
 
@@ -213,16 +217,91 @@ CLI не создаёт новую задачу и не меняет схему.
 
 `ProcessingRuntime` — минимальный владелец ресурсов для lifespan FastAPI и CLI. При импорте/старте приложения провайдеры не создаются, модель не загружается, БД не открывается. Первый `get_pipeline()` создаёт провайдеры через существующие фабрики; последующие задачи используют те же экземпляры. Whisper загружается при первой транскрибации в worker-потоке и сериализует inference своим существующим lock. Асинхронные клиенты закрываются при выходе из runtime, engine освобождается; частичная инициализация также очищает уже созданные ресурсы. Ошибка настройки провайдеров до захвата оставляет задачу `PENDING`.
 
-Для следующего HTTP-этапа подготовлен независимый callback (endpoint пока не добавлен):
+HTTP endpoint регистрирует безопасную обёртку существующего runner:
 
 ```python
 background_tasks.add_task(
-    run_analysis_job,
+    run_background_analysis,
     job_id,
     runtime=application.state.processing_runtime,
 )
 ```
 
-`run_analysis_job` принимает UUID и app-owned runtime, не зависит от Request и не получает request-scoped Session. Lifespan хранит runtime в `application.state.processing_runtime`; standalone-код использует `async with ProcessingRuntime(settings)`. Сам callback не закрывает общие ресурсы после каждой задачи.
+`run_analysis_job` принимает UUID и app-owned runtime, не зависит от Request и не получает request-scoped Session. Lifespan хранит runtime в `application.state.processing_runtime`; standalone-код использует `async with ProcessingRuntime(settings)`. Сам callback не закрывает общие ресурсы после каждой задачи. HTTP-обёртка `run_background_analysis` ловит обычные исключения после безопасного логирования runner, чтобы ASGI-сервер не вывел чувствительный traceback после отправки 202; pipeline уже пытается записать `FAILED`. Отмена по-прежнему пробрасывается, CLI сохраняет прежнее поведение с пробросом ошибок.
 
-BackgroundTasks выполняет работу внутри процесса приложения. При аварийном завершении процесса задача может остаться незавершённой; durable delivery, восстановления зависших задач и persistent queue нет. При нескольких Uvicorn workers каждый процесс может загрузить свою локальную модель. Это ограниченный механизм MVP без production-grade гарантий доставки. Следующий этап может подключить HTTP API к готовому callback; retry, восстановление и frontend пока отсутствуют.
+BackgroundTasks выполняет работу внутри процесса приложения. При аварийном завершении процесса задача может остаться незавершённой; durable delivery, восстановления зависших задач и persistent queue нет. При нескольких Uvicorn workers каждый процесс может загрузить свою локальную модель. Это ограниченный механизм MVP без production-grade гарантий доставки. Retry, восстановление и frontend пока отсутствуют.
+
+## REST API
+
+Перед первой загрузкой инициализируйте БД и задайте `OPENAI_API_KEY` для Analyzer (также нужен облачному STT). Используются прежние настройки STT/LLM, `DATABASE_URL`, `AUDIO_STORAGE_DIR` и `MAX_AUDIO_SIZE_MB`:
+
+```bash
+uv run python scripts/init_db.py
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+В другом терминале:
+
+```bash
+curl -i -F 'file=@recording.wav' http://127.0.0.1:8000/api/v1/analyses
+# HTTP 202, Location: /api/v1/analyses/<job_id>
+# {"job_id":"550e8400-e29b-41d4-a716-446655440000","status":"PENDING"}
+
+curl http://127.0.0.1:8000/api/v1/analyses/550e8400-e29b-41d4-a716-446655440000
+```
+
+| Endpoint | Назначение | Успех |
+| --- | --- | --- |
+| `POST /api/v1/analyses` | Multipart-поле `file`: сохранение аудио, commit `PENDING`, регистрация BackgroundTasks | 202 + UUID, статус `PENDING`, заголовок `Location` |
+| `GET /api/v1/analyses/{job_id}` | Актуальный статус и доступные результаты | 200 |
+| `GET /health` | Прежний healthcheck | 200, `{"status":"ok"}` |
+
+POST дожидается сохранения файла и commit задачи, затем отправляет 202 без ожидания STT/LLM. `PENDING` в ответе означает принятие; к моменту следующего GET статус уже может измениться. GET возвращает nullable `transcript`, `analysis`, `error`; транскрипт доступен после успешного STT, в том числе при последующей ошибке LLM. Завершённый результат использует прежний `AnalysisResult`:
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "COMPLETED",
+  "transcript": "Какая цель?",
+  "analysis": {
+    "summary": "Уточнили цель разговора",
+    "strengths": [{"description": "Задал уточняющий вопрос", "quote": "Какая цель?"}],
+    "mistakes": [],
+    "recommendations": ["Подвести итог"]
+  },
+  "error": null
+}
+```
+
+При `FAILED` поле `analysis` остаётся `null`, а `error` содержит безопасный машинный код и стадию, например `{"code":"ANALYSIS_TIMEOUT","stage":"analysis"}`. Ошибки HTTP имеют вид `{"detail":"..."}`: 400 — пустой файл или некорректное имя, 413 — превышение лимита, 415 — неподдерживаемое расширение, 422 — отсутствующее поле/некорректный UUID, 404 — неизвестная задача, 500 — внутренняя ошибка с безопасным сообщением. Пути аудио, ORM-поля и тексты внутренних исключений не возвращаются. OpenAPI доступен на `/openapi.json`, интерактивная документация — `/docs`.
+
+Разрешены `.wav`, `.mp3`, `.webm`, `.m4a` без учёта регистра, по умолчанию до 20 MiB. AudioStorage проверяет число фактически прочитанных байтов, включая запросы с неверным `Content-Length`, и читает файл порциями до 64 KiB. Исходное имя не используется как путь, файлы сохраняются под UUID. Проверяется расширение, содержимое/MIME не подтверждают реальный кодек: файл с допустимым расширением может быть принят, а ошибка декодирования затем даст `FAILED` на STT.
+
+FastAPI сначала разбирает multipart в `UploadFile` со spooled-файлом (небольшие данные в памяти, затем временный файл); лимит AudioStorage применяется при последующем чтении этого spool. Это не ограничение общего размера HTTP-запроса до multipart-разбора. Handler не читает весь файл в память и закрывает spool перед регистрацией фоновой обработки. Ошибка создания записи компенсируется удалением аудио существующим `create_job()`; при ней callback не регистрируется.
+
+Lifespan создаёт общий engine, фабрику сессий, AudioStorage и ленивый runtime без открытия БД, сетевых запросов и загрузки Whisper. HTTP и pipeline используют одну фабрику, но каждая операция создаёт свою сессию. Синхронные handlers ingestion/GET выполняются в thread pool FastAPI; фоновые операции используют прежний offloading pipeline. В BackgroundTasks передаются только UUID и долгоживущий runtime. При shutdown сначала закрываются клиенты, затем engine. Для тестов зависимости доступны через `app.core.dependencies`, фабрики провайдеров остаются подменяемыми.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant Storage
+    participant Repository
+    participant BackgroundTasks
+    participant Pipeline
+    Client->>API: POST multipart file
+    API->>Storage: save(stream) bounded reads
+    Storage-->>API: UUID audio key
+    API->>Repository: create_job / commit PENDING
+    API->>BackgroundTasks: add_task(UUID, runtime)
+    API-->>Client: 202 PENDING + Location
+    BackgroundTasks->>Pipeline: run_background_analysis → existing runner
+    Pipeline->>Repository: atomic claim → TRANSCRIBING
+    Note over Pipeline: STT → commit transcript / ANALYZING → LLM
+    Pipeline->>Repository: commit COMPLETED or FAILED
+    Client->>API: GET /api/v1/analyses/{job_id}
+    API->>Repository: read using fresh session
+    API-->>Client: status, transcript, AnalysisResult, error
+```
+
+Тесты HTTP-контракта отдельно перехватывают фоновые задачи, чтобы проверить `PENDING` без выполнения AI. Интеграционные тесты запускают настоящий pipeline с fake STT/LLM; отдельный ASGI-тест проверяет отправку тела 202 до STT, без измерения времени TestClient. API готов к подключению frontend в том же приложении; авторизация, история анализов и retry endpoint пока отсутствуют.

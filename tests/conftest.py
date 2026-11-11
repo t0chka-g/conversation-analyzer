@@ -117,3 +117,57 @@ def pipeline_case(session_factory, storage, analysis_result):
     return SimpleNamespace(
         pipeline=pipeline, job_id=job_id, transcriber=transcriber, analyzer=analyzer
     )
+
+
+@pytest.fixture
+def api_case(monkeypatch, session_factory, storage, analysis_result):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from app.main import create_app
+
+    monkeypatch.setenv("DATABASE_URL", str(session_factory.kw["bind"].url))
+    monkeypatch.setenv("AUDIO_STORAGE_DIR", str(storage.directory))
+    monkeypatch.setenv("MAX_AUDIO_SIZE_MB", "1")
+    transcriber = SimpleNamespace(
+        transcribe=AsyncMock(return_value="Какая цель?"), aclose=AsyncMock()
+    )
+    analyzer = SimpleNamespace(
+        analyze=AsyncMock(return_value=analysis_result), aclose=AsyncMock()
+    )
+    transcriber_factory = Mock(return_value=transcriber)
+    analyzer_factory = Mock(return_value=analyzer)
+    monkeypatch.setattr(
+        "app.application.runner._create_transcriber", transcriber_factory
+    )
+    monkeypatch.setattr("app.application.runner._create_analyzer", analyzer_factory)
+    application = create_app()
+    with TestClient(application) as client:
+        yield SimpleNamespace(
+            app=application,
+            client=client,
+            sessions=session_factory,
+            storage=storage,
+            transcriber=transcriber,
+            analyzer=analyzer,
+            transcriber_factory=transcriber_factory,
+            analyzer_factory=analyzer_factory,
+        )
+    assert application.state.analysis_sessions.kw["bind"].pool.checkedout() == 0
+    if transcriber_factory.called:
+        transcriber.aclose.assert_awaited_once()
+    if analyzer_factory.called:
+        analyzer.aclose.assert_awaited_once()
+
+
+@pytest.fixture
+def captured_background(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    tasks = []
+
+    async def capture(self):
+        tasks.extend(self.tasks)
+
+    monkeypatch.setattr(BackgroundTasks, "__call__", capture)
+    return tasks

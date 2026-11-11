@@ -10,6 +10,7 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "openai>=3.49.0",
     "sqlalchemy>=2.0,<3",
+    "python-multipart>=0.0.33",
 ]
 
 [dependency-groups]

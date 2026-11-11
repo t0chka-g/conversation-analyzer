@@ -8,6 +8,18 @@ class AudioStorageError(Exception):
     """Invalid audio input or failure accessing local audio storage."""
 
 
+class InvalidAudioError(AudioStorageError):
+    """Empty audio, invalid filename or a non-binary input stream."""
+
+
+class AudioTooLargeError(InvalidAudioError):
+    """The actual audio byte count exceeds the configured limit."""
+
+
+class UnsupportedAudioFormatError(InvalidAudioError):
+    """The audio filename has an unsupported extension."""
+
+
 class LocalAudioStorage:
     EXTENSIONS = frozenset({".wav", ".mp3", ".webm", ".m4a"})
     CHUNK_SIZE = 64 * 1024
@@ -22,10 +34,12 @@ class LocalAudioStorage:
         """The caller owns the stream. Only bounded binary reads are performed."""
         if (
             not isinstance(filename, str)
+            or not filename
             or any(character in filename for character in ("/", "\\", ":", "\x00"))
-            or Path(filename).suffix.lower() not in self.EXTENSIONS
         ):
-            raise AudioStorageError("Unsupported audio filename or extension")
+            raise InvalidAudioError("Invalid audio filename")
+        if Path(filename).suffix.lower() not in self.EXTENSIONS:
+            raise UnsupportedAudioFormatError("Unsupported audio extension")
         key = f"{uuid4()}{Path(filename).suffix.lower()}"
         final_path = self.directory / key
         temporary_path = self.directory / f".{uuid4()}.tmp"
@@ -38,17 +52,17 @@ class LocalAudioStorage:
                         min(self.CHUNK_SIZE, self.max_bytes - total + 1)
                     )
                     if not isinstance(chunk, bytes):
-                        raise AudioStorageError("Audio stream must return bytes")
+                        raise InvalidAudioError("Audio stream must return bytes")
                     if not chunk:
                         break
                     total += len(chunk)
                     if total > self.max_bytes:
-                        raise AudioStorageError(
+                        raise AudioTooLargeError(
                             "Audio exceeds the configured size limit"
                         )
                     destination.write(chunk)
                 if total == 0:
-                    raise AudioStorageError("Audio file is empty")
+                    raise InvalidAudioError("Audio file is empty")
             temporary_path.replace(final_path)
             return key
         except Exception as exc:
