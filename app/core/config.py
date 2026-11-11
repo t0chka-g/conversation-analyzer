@@ -1,8 +1,11 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 class Settings(BaseSettings):
@@ -27,6 +30,33 @@ class Settings(BaseSettings):
     openai_llm_model: str = Field(default="gpt-4o-mini", min_length=1)
     openai_llm_timeout: float = Field(default=120, gt=0, allow_inf_nan=False)
     openai_llm_max_retries: int = Field(default=1, ge=0, le=5)
+
+    database_url: str = "sqlite:///./data/app.db"
+    audio_storage_dir: Path = Path("./data/audio")
+    max_audio_size_mb: int = Field(default=20, gt=0)
+
+    @field_validator("database_url")
+    @classmethod
+    def sqlite_database(cls, value: str) -> str:
+        try:
+            url = make_url(value)
+        except ArgumentError:
+            raise ValueError("DATABASE_URL must be a valid SQLite URL") from None
+        if url.drivername not in {"sqlite", "sqlite+pysqlite"} or any(
+            value is not None
+            for value in (url.host, url.username, url.password, url.port)
+        ):
+            raise ValueError("DATABASE_URL must use local synchronous SQLite")
+        if url.query:
+            raise ValueError("SQLite URI/query options are not supported")
+        return value
+
+    @field_validator("audio_storage_dir", mode="before")
+    @classmethod
+    def nonempty_storage_dir(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("AUDIO_STORAGE_DIR must not be empty")
+        return value
 
 
 @lru_cache
