@@ -1,0 +1,174 @@
+import pytest
+from fastapi.testclient import TestClient
+
+from app.core.config import get_settings
+
+
+@pytest.fixture(autouse=True)
+def isolated_settings(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "APP_NAME",
+        "APP_ENV",
+        "DEBUG",
+        "LOG_LEVEL",
+        "STT_PROVIDER",
+        "WHISPER_MODEL",
+        "WHISPER_DEVICE",
+        "WHISPER_COMPUTE_TYPE",
+        "WHISPER_LANGUAGE",
+        "WHISPER_CPU_THREADS",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_STT_MODEL",
+        "OPENAI_STT_TIMEOUT",
+        "OPENAI_LLM_MODEL",
+        "OPENAI_LLM_TIMEOUT",
+        "OPENAI_LLM_MAX_RETRIES",
+        "DATABASE_URL",
+        "AUDIO_STORAGE_DIR",
+        "MAX_AUDIO_SIZE_MB",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def client():
+    from app.main import create_app
+
+    with TestClient(create_app()) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def session_factory(tmp_path):
+    from app.persistence.database import (
+        create_database_engine,
+        create_session_factory,
+        initialize_database,
+    )
+
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    initialize_database(engine)
+    yield create_session_factory(engine)
+    assert engine.pool.checkedout() == 0
+    engine.dispose()
+
+
+@pytest.fixture
+def job_id(session_factory):
+    from uuid import uuid4
+
+    from app.persistence.repository import AnalysisJobRepository
+
+    job_id = uuid4()
+    with session_factory.begin() as session:
+        AnalysisJobRepository(session).create(
+            job_id=job_id, source="upload", audio_path=f"{uuid4()}.wav"
+        )
+    return job_id
+
+
+@pytest.fixture
+def analysis_result():
+    from app.analysis.models import AnalysisResult, Finding
+
+    return AnalysisResult(
+        summary="Обсудили условия",
+        strengths=[Finding(description="Уточнил цель", quote="Какая цель?")],
+        mistakes=[],
+        recommendations=["Подвести итог"],
+    )
+
+
+@pytest.fixture
+def storage(tmp_path):
+    from app.storage.local import LocalAudioStorage
+
+    return LocalAudioStorage(tmp_path / "audio", max_audio_size_mb=1)
+
+
+@pytest.fixture
+def pipeline_case(session_factory, storage, analysis_result):
+    from io import BytesIO
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.application.create_job import create_job
+    from app.application.pipeline import ProcessingPipeline
+
+    job_id = create_job(
+        BytesIO(b"test audio"),
+        filename="test.wav",
+        source="upload",
+        storage=storage,
+        session_factory=session_factory,
+    )
+    transcriber = SimpleNamespace(transcribe=AsyncMock(return_value="  Какая цель?\n"))
+    analyzer = SimpleNamespace(analyze=AsyncMock(return_value=analysis_result))
+    pipeline = ProcessingPipeline(
+        transcriber=transcriber,
+        analyzer=analyzer,
+        session_factory=session_factory,
+        storage=storage,
+    )
+    return SimpleNamespace(
+        pipeline=pipeline, job_id=job_id, transcriber=transcriber, analyzer=analyzer
+    )
+
+
+@pytest.fixture
+def api_case(monkeypatch, session_factory, storage, analysis_result):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from app.main import create_app
+
+    monkeypatch.setenv("DATABASE_URL", str(session_factory.kw["bind"].url))
+    monkeypatch.setenv("AUDIO_STORAGE_DIR", str(storage.directory))
+    monkeypatch.setenv("MAX_AUDIO_SIZE_MB", "1")
+    transcriber = SimpleNamespace(
+        transcribe=AsyncMock(return_value="Какая цель?"), aclose=AsyncMock()
+    )
+    analyzer = SimpleNamespace(
+        analyze=AsyncMock(return_value=analysis_result), aclose=AsyncMock()
+    )
+    transcriber_factory = Mock(return_value=transcriber)
+    analyzer_factory = Mock(return_value=analyzer)
+    monkeypatch.setattr(
+        "app.application.runner._create_transcriber", transcriber_factory
+    )
+    monkeypatch.setattr("app.application.runner._create_analyzer", analyzer_factory)
+    application = create_app()
+    with TestClient(application) as client:
+        yield SimpleNamespace(
+            app=application,
+            client=client,
+            sessions=session_factory,
+            storage=storage,
+            transcriber=transcriber,
+            analyzer=analyzer,
+            transcriber_factory=transcriber_factory,
+            analyzer_factory=analyzer_factory,
+        )
+    assert application.state.analysis_sessions.kw["bind"].pool.checkedout() == 0
+    if transcriber_factory.called:
+        transcriber.aclose.assert_awaited_once()
+    if analyzer_factory.called:
+        analyzer.aclose.assert_awaited_once()
+
+
+@pytest.fixture
+def captured_background(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    tasks = []
+
+    async def capture(self):
+        tasks.extend(self.tasks)
+
+    monkeypatch.setattr(BackgroundTasks, "__call__", capture)
+    return tasks

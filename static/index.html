@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Запись разговоров и AI-анализ: транскрипция, сильные стороны, ошибки и рекомендации."
+    />
+    <title>Conversation Analyzer</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">К основному содержимому</a>
+
+    <div class="page">
+      <header class="top">
+        <div class="brand-block">
+          <p class="brand">Conversation Analyzer</p>
+          <h1 class="tagline">
+            Запишите разговор - получите разбор с цитатами и рекомендациями
+          </h1>
+          <p class="lede">
+            Микрофон или готовый файл. Транскрипция и AI-анализ выполняются на сервере.
+          </p>
+        </div>
+        <div class="state-chip" id="state-chip" data-state="idle" aria-live="polite">
+          <span class="state-dot" aria-hidden="true"></span>
+          <span class="state-label" id="state-label">Готово к записи</span>
+        </div>
+      </header>
+
+      <main id="main" class="layout">
+        <section class="panel recorder-panel" aria-labelledby="recorder-title">
+          <div class="panel-head">
+            <h2 id="recorder-title">Запись</h2>
+            <p class="panel-note" id="mic-status">Микрофон: статус неизвестен</p>
+          </div>
+
+          <div class="recorder">
+            <div class="meter-wrap" aria-hidden="true">
+              <canvas id="level-meter" width="320" height="48"></canvas>
+            </div>
+
+            <div class="timer-row">
+              <span
+                class="rec-indicator"
+                id="rec-indicator"
+                hidden
+                aria-hidden="true"
+              ></span>
+              <p class="timer" id="timer" aria-label="Длительность записи">00:00</p>
+            </div>
+
+            <div class="recorder-actions">
+              <button type="button" class="btn btn-primary btn-lg" id="btn-start">
+                Начать запись
+              </button>
+              <button type="button" class="btn btn-danger btn-lg" id="btn-stop" disabled>
+                Остановить
+              </button>
+            </div>
+
+            <p class="hint" id="recorder-hint">
+              После остановки запись отправится на анализ автоматически.
+            </p>
+          </div>
+        </section>
+
+        <section class="panel upload-panel" aria-labelledby="upload-title">
+          <div class="panel-head">
+            <h2 id="upload-title">Или загрузите файл</h2>
+            <p class="panel-note">WAV, MP3, WEBM, M4A · до 20&nbsp;МБ</p>
+          </div>
+
+          <div
+            class="dropzone"
+            id="dropzone"
+            tabindex="0"
+            role="button"
+            aria-controls="file-input"
+            aria-label="Выбрать аудиофайл или перетащить сюда"
+          >
+            <input
+              type="file"
+              id="file-input"
+              accept=".wav,.mp3,.webm,.m4a,audio/wav,audio/mpeg,audio/webm,audio/mp4"
+              hidden
+            />
+            <p class="dropzone-title">Перетащите аудио сюда</p>
+            <p class="dropzone-sub">или нажмите, чтобы выбрать файл</p>
+          </div>
+
+          <div class="preview" id="preview" hidden>
+            <div class="preview-meta">
+              <p class="preview-name" id="preview-name"></p>
+              <p class="preview-size" id="preview-size"></p>
+            </div>
+            <audio id="preview-audio" controls preload="metadata"></audio>
+            <div class="preview-actions">
+              <button type="button" class="btn btn-primary" id="btn-upload" hidden>
+                Отправить на анализ
+              </button>
+              <button type="button" class="btn btn-ghost" id="btn-clear-preview">
+                Удалить
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section
+          class="panel status-panel"
+          aria-labelledby="progress-title"
+          id="status-panel"
+        >
+          <div class="panel-head">
+            <h2 id="progress-title">Обработка</h2>
+            <p class="panel-note" id="job-id-line" hidden></p>
+          </div>
+          <ol class="steps" id="steps" aria-label="Этапы обработки">
+            <li data-step="PENDING">Принято</li>
+            <li data-step="TRANSCRIBING">Транскрибация</li>
+            <li data-step="ANALYZING">Анализ</li>
+            <li data-step="COMPLETED">Готово</li>
+          </ol>
+          <p class="status-message" id="status-message" aria-live="polite"></p>
+          <div class="status-actions">
+            <button type="button" class="btn btn-ghost" id="btn-resume-poll" hidden>
+              Проверить статус снова
+            </button>
+            <button type="button" class="btn btn-ghost" id="btn-reset" hidden>
+              Новый разбор
+            </button>
+          </div>
+        </section>
+
+        <section
+          class="panel results-panel"
+          aria-labelledby="results-title"
+          id="results-panel"
+          hidden
+        >
+          <div class="panel-head">
+            <h2 id="results-title">Результат</h2>
+          </div>
+
+          <article class="result-block" aria-labelledby="summary-title">
+            <h3 id="summary-title">Краткое содержание</h3>
+            <p class="summary-text" id="summary-text"></p>
+          </article>
+
+          <div class="result-grid">
+            <article class="result-block" aria-labelledby="strengths-title">
+              <h3 id="strengths-title">Сильные стороны</h3>
+              <ul class="finding-list" id="strengths-list"></ul>
+            </article>
+            <article class="result-block" aria-labelledby="mistakes-title">
+              <h3 id="mistakes-title">Ошибки и риски</h3>
+              <ul class="finding-list" id="mistakes-list"></ul>
+            </article>
+          </div>
+
+          <article class="result-block" aria-labelledby="recs-title">
+            <h3 id="recs-title">Рекомендации</h3>
+            <ul class="rec-list" id="recs-list"></ul>
+          </article>
+
+          <details class="transcript-details" id="transcript-details">
+            <summary>Транскрипция</summary>
+            <pre class="transcript" id="transcript-text"></pre>
+          </details>
+        </section>
+
+        <div
+          class="alert"
+          id="alert"
+          role="alert"
+          aria-live="assertive"
+          hidden
+        ></div>
+      </main>
+
+      <footer class="foot">
+        <p>
+          Запись с микрофона доступна на localhost или по HTTPS. Поддерживаемые
+          форматы файлов совпадают с API: WAV, MP3, WEBM, M4A.
+        </p>
+      </footer>
+    </div>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

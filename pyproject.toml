@@ -1,0 +1,29 @@
+[project]
+name = "conversation-analyzer"
+version = "0.1.0"
+description = "Conversation recording and AI analysis backend"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "pydantic-settings>=2.6,<3",
+    "faster-whisper>=1.2.1",
+    "openai>=3.49.0",
+    "sqlalchemy>=2.0,<3",
+    "python-multipart>=0.0.33",
+    "av<19",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "httpx>=0.27,<1", "ruff>=0.8,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
